@@ -176,6 +176,7 @@ typedef struct
         size_t num_processes;
         size_t socket_count;
         bool busypoll;
+        bool resolve_nameservers;
     } cmd_args;
 
     struct

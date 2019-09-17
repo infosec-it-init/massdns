@@ -22,6 +22,7 @@
 #endif
 #include <limits.h>
 #include <stdarg.h>
+#include <netdb.h>
 
 #ifdef PCAP_SUPPORT
 #include <net/ethernet.h>
@@ -55,6 +56,7 @@ void print_help()
                     "      --rcvbuf           Size of the receive buffer in bytes.\n"
                     "      --retry            Unacceptable DNS response codes. (Default: REFUSED)\n"
                     "  -r  --resolvers        Text file containing DNS resolvers.\n"
+                    "      --resolve-ns       Resolve the nameservers given in the domains file.\n"
                     "      --root             Do not drop privileges when running as root. Not recommended.\n"
                     "  -s  --hashmap-size     Number of concurrent lookups. (Default: 10000)\n"
                     "      --sndbuf           Size of the send buffer in bytes.\n"
@@ -551,19 +553,40 @@ lookup_t *new_lookup(const char *qname, dns_record_type type, bool *new)
 resolver_t* create_resolver_from_nameserver(char *nameserver)
 {
     resolver_t *resolver = safe_calloc(sizeof(*resolver));
-    struct sockaddr_storage *addr = &resolver->address;
-    if (str_to_addr(nameserver, 53, addr))
+    if (context.cmd_args.resolve_nameservers)
     {
-        if(!(addr->ss_family == AF_INET && context.sockets.interfaces4.len > 0)
-            && !(addr->ss_family == AF_INET6 && context.sockets.interfaces6.len > 0))
-        {
-            log_msg("No query socket for resolver \"%s\" found.\n", nameserver);
-        }
+        struct addrinfo *nsaddr;
+        struct addrinfo hints;
+        int s;
+        
+        memset(&hints, 0, sizeof hints);
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_DGRAM;
+        hints.ai_flags = AI_PASSIVE;
+        hints.ai_protocol = 0;
+        hints.ai_canonname = NULL;
+        hints.ai_addr = NULL;
+        hints.ai_next = NULL;
+        s = getaddrinfo(nameserver, "53", NULL, &nsaddr);
+        resolver->address = *((struct sockaddr_storage *) nsaddr->ai_addr);
     }
     else
     {
-        log_msg("\"%s\" is not a valid resolver. Skipped.\n", nameserver);
+        struct sockaddr_storage *addr = &resolver->address;
+        if (str_to_addr(nameserver, 53, addr))
+        {
+            if(!(addr->ss_family == AF_INET && context.sockets.interfaces4.len > 0)
+                && !(addr->ss_family == AF_INET6 && context.sockets.interfaces6.len > 0))
+            {
+                log_msg("No query socket for resolver \"%s\" found.\n", nameserver);
+            }
+        }
+        else
+        {
+            log_msg("\"%s\" is not a valid resolver. Skipped.\n", nameserver);
+        }
     }
+    
     return resolver;
 }
 
@@ -2056,6 +2079,10 @@ int parse_cmd(int argc, char **argv)
         else if (strcmp(argv[i], "--quiet") == 0 || strcmp(argv[i], "-q") == 0)
         {
             context.cmd_args.quiet = true;
+        }
+        else if (strcmp(argv[i], "--resolve-ns") == 0)
+        {
+            context.cmd_args.resolve_nameservers = true;
         }
         else if (strcmp(argv[i], "--extreme") == 0)
         {

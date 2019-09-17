@@ -976,6 +976,8 @@ void do_read(uint8_t *offset, size_t len, struct sockaddr_storage *recvaddr)
         dns_record_t rec;
         size_t non_add_count = packet.head.header.ans_count + packet.head.header.auth_count;
         dns_section_t section = DNS_SECTION_ANSWER;
+        char *query_name;
+        dns_record_type query_type;
 
         switch(context.cmd_args.output)
         {
@@ -1012,6 +1014,33 @@ void do_read(uint8_t *offset, size_t len, struct sockaddr_storage *recvaddr)
                             json_buffer);
                 }
 
+                break;
+            
+            case OUTPUT_CSV_SIMPLE: // Only print records from answer section that match the query name and query type (in simple csv format)
+                query_name = strmcpy(dns_name2str(&packet.head.question.name));
+                query_type = (dns_record_type) packet.head.question.type;
+                fprintf(context.outfile,
+                        "%s;%s;@%s;%s;",
+                        query_name,
+                        dns_record_type2str(query_type),
+                        sockaddr2str(recvaddr),
+                        dns_rcode2str((dns_rcode)packet.head.header.rcode));
+                bool is_first = true;
+                for(size_t rec_index = 0; dns_parse_record_raw(offset, next, offset + len, &next, &rec); rec_index++)
+                {
+                    if (strcmp(query_name, dns_name2str(&rec.name)) == 0 && query_type == ((dns_record_type) rec.type)) {
+                        
+                        json_escape(json_buffer, dns_raw_record_data2str(&rec, offset, offset + short_len), sizeof(json_buffer));
+
+                        fprintf(context.outfile,
+                                "%s\"%s\"",
+                                is_first ? "[" : ",",
+                                json_buffer);
+                        is_first = false;
+                    }
+                }
+                fprintf(context.outfile, "%s\n", is_first ? "" : "]");
+                free(query_name);
                 break;
 
             case OUTPUT_TEXT_SIMPLE: // Only print records from answer section that match the query name
@@ -1863,6 +1892,10 @@ int parse_cmd(int argc, char **argv)
             {
                 case 'B':
                     context.cmd_args.output = OUTPUT_BINARY;
+                    break;
+
+                case 'C':
+                    context.cmd_args.output = OUTPUT_CSV_SIMPLE;
                     break;
 
                 case 'J':

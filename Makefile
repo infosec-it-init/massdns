@@ -6,6 +6,9 @@ all:
 debug:
 	mkdir -p bin
 	$(CC) $(CFLAGS) -O0 -std=c11 -DHAVE_EPOLL -DHAVE_SYSINFO -Wall -g -DDEBUG main.c -o bin/massdns
+debugnolinux:
+	mkdir -p bin
+	$(CC) $(CFLAGS) -O0 -std=c11 -Wall -g -DDEBUG main.c -o bin/massdns
 nolinux:
 	mkdir -p bin
 	$(CC) $(CFLAGS) -O3 -std=c11 -Wall -fstack-protector-strong main.c -o bin/massdns

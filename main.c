@@ -22,7 +22,6 @@
 #endif
 #include <limits.h>
 #include <stdarg.h>
-#include <netdb.h>
 
 #ifdef PCAP_SUPPORT
 #include <net/ethernet.h>
@@ -90,6 +89,31 @@ void print_help()
     );
 }
 
+void free_lookup(lookup_t *lookup)
+{
+    // free the nameservers array
+    if(lookup->nameservers)
+    {
+        int i;
+        for (i = 0; *(lookup->nameservers + i); i++)
+        {
+            free(*(lookup->nameservers + i));
+        }
+        free(lookup->nameservers);
+    }
+    // free the initial lookup list
+    if(lookup->initial_lookups)
+    {
+        single_list_free(lookup->initial_lookups);
+    }
+}
+
+bool free_hash_key(char *key, void *value, void *context)
+{
+    free(key);
+    return true;
+}
+
 void cleanup()
 {
 #ifdef PCAP_SUPPORT
@@ -107,19 +131,17 @@ void cleanup()
             Entry* entry = context.map->buckets[i];
             while (entry != NULL)
             {
-                lookup_t *lookup = (lookup_t *) entry->value;
-                if (*(lookup->nameservers))
-                {
-                    for (i = 0; *(lookup->nameservers + i); i++)
-                    {
-                        free(*(lookup->nameservers + i));
-                    }
-                    free(lookup->nameservers);
-                }
+                free_lookup((lookup_t *) entry->value);
                 entry = entry->next;
             }
         }
         hashmapFree(context.map);
+    }
+    
+    if(context.nameserver_map)
+    {
+        hashmapForEach(context.nameserver_map, (bool (*)(void *key, void *value, void *context)) free_hash_key, NULL);
+        hashmapFree(context.nameserver_map);
     }
 
     if(context.resolver_map)
@@ -130,6 +152,11 @@ void cleanup()
     timed_ring_destroy(&context.ring);
 
     free(context.resolvers.data);
+
+    if(context.dynamic_resolvers)
+    {
+        single_list_free_with_elements(context.dynamic_resolvers);
+    }
 
     free(context.sockets.interfaces4.data);
     free(context.sockets.interfaces6.data);
@@ -517,19 +544,21 @@ lookup_t *new_lookup(const char *qname, dns_record_type type, bool *new)
     }
 
     key->type = type;
-    if(hashmapGet(context.map, key) != NULL)
+    lookup_t *value;
+    if((value = (lookup_t *) hashmapGet(context.map, key)) != NULL)
     {
         context.lookup_pool.len++;
         *new = false;
-        return NULL;
+        return value;
     }
     *new = true;
-    lookup_t *value = &entry->value;
+    value = &entry->value;
     bzero(value, sizeof(*value));
 
     value->ring_entry = timed_ring_add(&context.ring, context.cmd_args.interval_ms * TIMED_RING_MS, value);
     urandom_get(&value->transaction, sizeof(value->transaction));
     value->key = key;
+    value->normal_lookup = true;
 
     errno = 0;
     hashmapPut(context.map, key, value);
@@ -545,38 +574,73 @@ lookup_t *new_lookup(const char *qname, dns_record_type type, bool *new)
     {
         end_warmup();
     }
-
     return value;
 }
 
+void send_query(lookup_t *lookup);
+void send_query_with_resolver(lookup_t *lookup);
 
-resolver_t* create_resolver_from_nameserver(char *nameserver)
+void send_query_to_nameserver(lookup_t *lookup)
 {
-    resolver_t *resolver = safe_calloc(sizeof(*resolver));
+    char *nameserver = *(lookup->nameservers + lookup->nameserver_index);
+    //log_msg("trying nameserver %s for %s\n", nameserver, lookup->key->name.name);
+    bool valid_resolver = false;
     if (context.cmd_args.resolve_nameservers)
     {
-        struct addrinfo *nsaddr;
-        struct addrinfo hints;
-        int s;
-        
-        memset(&hints, 0, sizeof hints);
-        hints.ai_family = AF_UNSPEC;
-        hints.ai_socktype = SOCK_DGRAM;
-        hints.ai_flags = AI_PASSIVE;
-        hints.ai_protocol = 0;
-        hints.ai_canonname = NULL;
-        hints.ai_addr = NULL;
-        hints.ai_next = NULL;
-        s = getaddrinfo(nameserver, "53", NULL, &nsaddr);
-        resolver->address = *((struct sockaddr_storage *) nsaddr->ai_addr);
+        // check if resolved nameserver is already in hashmap!!
+        resolver_t *resolver = hashmapGet(context.nameserver_map, nameserver);
+        if(resolver != NULL)
+        {
+            //log_msg("found resolver in cache for nameserver: %s\n", nameserver);
+            //log_msg("increasing nameserver_index: %s -> %d\n", lookup->key->name.name, lookup->nameserver_index);
+            lookup->nameserver_index++;
+            lookup->resolver = resolver;
+            send_query_with_resolver(lookup);
+        }
+        else
+        {
+            bool new;
+            // create a new lookup for the nameserver
+            lookup_t *ns_lookup = new_lookup(nameserver, context.cmd_args.record_type, &new);
+            
+            // Pause the timeout of the initial lookup until nameserver is resolved
+            timed_ring_remove(&context.ring, lookup->ring_entry);
+            
+            if(new)
+            {
+                // send lookup query
+                // reference the inital lookup to complete once ns lookup has finished
+                ns_lookup->normal_lookup = false;
+                ns_lookup->initial_lookups = single_list_new();
+                //log_msg("pushing to fresh initial lookups: %s (%s)\n", lookup->key->name.name, ns_lookup->key->name.name);
+                single_list_push_back(ns_lookup->initial_lookups, lookup);
+                send_query(ns_lookup);
+            }
+            else
+            {
+                //log_msg("pushing to existing initial lookups: %s (%s)\n", lookup->key->name.name, ns_lookup->key->name.name);
+                // add the initial lookup to the pending query
+                if(!ns_lookup->initial_lookups)
+                {
+                    ns_lookup->initial_lookups = single_list_new();
+                }
+                single_list_push_back(ns_lookup->initial_lookups, lookup);
+            }
+        }
     }
     else
     {
+        resolver_t *resolver = safe_calloc(sizeof(*resolver));
         struct sockaddr_storage *addr = &resolver->address;
         if (str_to_addr(nameserver, 53, addr))
         {
-            if(!(addr->ss_family == AF_INET && context.sockets.interfaces4.len > 0)
-                && !(addr->ss_family == AF_INET6 && context.sockets.interfaces6.len > 0))
+            if((addr->ss_family == AF_INET && context.sockets.interfaces4.len > 0)
+                || (addr->ss_family == AF_INET6 && context.sockets.interfaces6.len > 0))
+            {
+                valid_resolver = true;
+                resolver->dedicated_nameserver = true;
+            }
+            else
             {
                 log_msg("No query socket for resolver \"%s\" found.\n", nameserver);
             }
@@ -585,23 +649,34 @@ resolver_t* create_resolver_from_nameserver(char *nameserver)
         {
             log_msg("\"%s\" is not a valid resolver. Skipped.\n", nameserver);
         }
+        lookup->nameserver_index++;
+        if(valid_resolver)
+        {
+            // put resolver into list of dynamic resolvers to free in the end
+            single_list_push_back(context.dynamic_resolvers, resolver);
+            lookup->resolver = resolver;
+            send_query_with_resolver(lookup);
+        }
+        else
+        {
+            free(resolver);
+            // resolving from nameserver failed
+            send_query(lookup);
+        }
     }
-    
-    return resolver;
 }
 
-void send_query(lookup_t *lookup)
+bool set_resolver(lookup_t *lookup)
 {
-    static uint8_t query_buffer[0x200];
-
-    // Choose random resolver
+    // Use nameserver or choose random resolver
     // Pool of resolvers cannot be empty due to check after parsing resolvers.
     if(!context.cmd_args.sticky || lookup->resolver == NULL)
     {
         if(lookup->nameservers && *(lookup->nameservers + lookup->nameserver_index))
         {
-            lookup->resolver = create_resolver_from_nameserver(*(lookup->nameservers + lookup->nameserver_index));
-            lookup->nameserver_index++;
+            // send query possibly async since it might be necessary to resolve nameserver
+            send_query_to_nameserver(lookup);
+            return false;
         }
         else if(context.cmd_args.predictable_resolver)
         {
@@ -612,6 +687,12 @@ void send_query(lookup_t *lookup)
             lookup->resolver = ((resolver_t *) context.resolvers.data) + urandom_size_t() % context.resolvers.len;
         }
     }
+    return true;
+}
+
+void send_query_with_resolver(lookup_t *lookup)
+{
+    static uint8_t query_buffer[0x200];
 
     // We need to select the correct socket pool: IPv4 socket pool for IPv4 resolver/IPv6 socket pool for IPv6 resolver
     buffer_t *interfaces;
@@ -631,7 +712,7 @@ void send_query(lookup_t *lookup)
         size_t socket_index = urandom_size_t() % interfaces->len;
         lookup->socket = (socket_info_t *) interfaces->data + socket_index;
     }
-
+    
     ssize_t result = dns_question_create(query_buffer, (char*)lookup->key->name.name, lookup->key->type,
                                                    lookup->transaction);
     if (result < DNS_PACKET_MINIMUM_SIZE)
@@ -653,6 +734,14 @@ void send_query(lookup_t *lookup)
         {
             log_msg("Error sending: %s\n", strerror(errno));
         }
+    }
+}
+
+void send_query(lookup_t *lookup)
+{
+    if (set_resolver(lookup))
+    {
+        send_query_with_resolver(lookup);
     }
 }
 
@@ -918,7 +1007,8 @@ void can_send()
     char **nameservers;
     bool new;
 
-    while (hashmapSize(context.map) < context.cmd_args.hashmap_size && context.state <= STATE_QUERYING)
+    // always have one extra for an additional possible nameserver lookup
+    while (hashmapSize(context.map) < context.cmd_args.hashmap_size - 5 && context.state <= STATE_QUERYING)
     {
         if(!next_query(&qname, &nameservers))
         {
@@ -927,13 +1017,15 @@ void can_send()
         }
         context.stats.numdomains++;
         lookup_t *lookup = new_lookup(qname, context.cmd_args.record_type, &new);
+        if(!new)
+        {
+            // the lookup is already pending, make sure it is a normal lookup as well!
+            lookup->normal_lookup = true;
+            continue;
+        }
         if (nameservers)
         {
             lookup->nameservers = nameservers;
-        }
-        if(!new)
-        {
-            continue;
         }
         send_query(lookup);
     }
@@ -946,18 +1038,9 @@ bool is_unacceptable(dns_pkt_t *packet)
 
 void lookup_done(lookup_t *lookup)
 {
-    int i;
     context.stats.finished++;
 
-    // free the nameservers array
-    if (lookup->nameservers)
-    {
-        for (i = 0; *(lookup->nameservers + i); i++)
-        {
-            free(*(lookup->nameservers + i));
-        }
-        free(lookup->nameservers);
-    }
+    free_lookup(lookup);
     hashmapRemove(context.map, lookup->key);
 
     // Return lookup to pool.
@@ -986,7 +1069,26 @@ bool retry(lookup_t *lookup)
     if(lookup->tries < context.cmd_args.resolve_count)
     {
         lookup->ring_entry = timed_ring_add(&context.ring, context.cmd_args.interval_ms * TIMED_RING_MS, lookup);
-        send_query(lookup);
+        // use a dedicated nameserver several times in a retry (until single_resolve_count is reached) before switching to next resolver
+        if(lookup->resolver->dedicated_nameserver)
+        {
+            if(++lookup->single_tries < context.cmd_args.single_resolve_count)
+            {
+                // retry with same resolver!!
+                send_query_with_resolver(lookup);
+            }
+            else
+            {
+                // retry with a new resolver
+                lookup->single_tries = 0;
+                send_query(lookup);
+            }
+        }
+        else
+        {
+            // no dedicated nameserver, normal retry
+            send_query(lookup);
+        }
         return true;
     }
     return false;
@@ -1006,6 +1108,79 @@ void ring_timeout(void *param)
         lookup_done(lookup);
     }
 }
+void finish_lookup_with_resolved_ns(lookup_t *lookup, char *resolved_ip)
+{
+    if(lookup->initial_lookups)
+    {
+        bool valid_resolver = false;
+        resolver_t *resolver = safe_calloc(sizeof(*resolver));
+        struct sockaddr_storage *addr = &resolver->address;
+        if (str_to_addr(resolved_ip, 53, addr))
+        {
+            if((addr->ss_family == AF_INET && context.sockets.interfaces4.len > 0)
+                || (addr->ss_family == AF_INET6 && context.sockets.interfaces6.len > 0))
+            {
+                valid_resolver = true;
+            }
+            else
+            {
+                log_msg("No query socket for resolver \"%s\" found.\n", resolved_ip);
+            }
+        }
+        else
+        {
+            log_msg("\"%s\" is not a valid resolver. Skipped.\n", resolved_ip);
+        }
+        if(valid_resolver)
+        {
+            // put resolver into list of dynamic resolvers to free in the end
+            single_list_push_back(context.dynamic_resolvers, resolver);
+            // put this resolver into cache hashmap
+            hashmapPut(context.nameserver_map, strmcpy((char *) lookup->key->name.name), resolver);
+        }
+        else
+        {
+            free(resolver);
+        }
+        single_list_element_t* element = lookup->initial_lookups->first;
+        while (element != NULL)
+        {
+            lookup_t *initial_lookup = (lookup_t *) element->data;
+            initial_lookup->nameserver_index++;
+            // re-install the timeout
+            initial_lookup->ring_entry = timed_ring_add(&context.ring, context.cmd_args.interval_ms * TIMED_RING_MS, initial_lookup);
+            if(valid_resolver)
+            {
+                initial_lookup->resolver = resolver;
+                send_query_with_resolver(initial_lookup);
+            }
+            else
+            {
+                send_query(initial_lookup);
+            }
+            element = element->next;
+        }
+        single_list_free(lookup->initial_lookups);
+        lookup->initial_lookups = NULL;
+    }
+}
+
+void fallback_lookups(lookup_t *lookup)
+{
+    if(lookup->initial_lookups)
+    {
+        single_list_element_t* element = lookup->initial_lookups->first;
+        while (element != NULL)
+        {
+            lookup_t *initial_lookup = (lookup_t *) element->data;
+            initial_lookup->nameserver_index++;
+            send_query(initial_lookup);
+            element = element->next;
+        }
+        single_list_free(lookup->initial_lookups);
+        lookup->initial_lookups = NULL;
+    }
+}
 
 void do_read(uint8_t *offset, size_t len, struct sockaddr_storage *recvaddr)
 {
@@ -1014,7 +1189,6 @@ void do_read(uint8_t *offset, size_t len, struct sockaddr_storage *recvaddr)
     static lookup_t *lookup;
     static resolver_t* resolver;
     static char json_buffer[0xFFFF];
-
     context.stats.current_rate++;
     context.stats.numreplies++;
 
@@ -1044,7 +1218,6 @@ void do_read(uint8_t *offset, size_t len, struct sockaddr_storage *recvaddr)
         context.stats.mismatch_domain++;
         return;
     }
-
     if(lookup->transaction != packet.head.header.id)
     {
         context.stats.mismatch_id++;
@@ -1059,6 +1232,11 @@ void do_read(uint8_t *offset, size_t len, struct sockaddr_storage *recvaddr)
         // We may have tried to many times already.
         if(!retry(lookup))
         {
+            // fallback for initial lookups depending on this ns lookup
+            if(lookup->initial_lookups)
+            {
+                fallback_lookups(lookup);
+            }
             // If this is the case, we will not try again.
             lookup_done(lookup);
         }
@@ -1069,167 +1247,210 @@ void do_read(uint8_t *offset, size_t len, struct sockaddr_storage *recvaddr)
         context.stats.finished_success++;
         context.stats.final_rcodes[packet.head.header.rcode]++;
         context.stats.success_rate++;
-
-        // Print packet
-        time_t now = time(NULL);
-        uint16_t short_len = (uint16_t) len;
-        uint8_t *next = parse_offset;
-        dns_record_t rec;
-        size_t non_add_count = packet.head.header.ans_count + packet.head.header.auth_count;
-        dns_section_t section = DNS_SECTION_ANSWER;
-        char *query_name;
-        dns_record_type query_type;
-
-        switch(context.cmd_args.output)
+        if(lookup->initial_lookups)
         {
-            case OUTPUT_BINARY:
-                // The output file is platform dependent for performance reasons.
-                fwrite(&now, sizeof(now), 1, context.outfile);
-                fwrite(recvaddr, sizeof(*recvaddr), 1, context.outfile);
-                fwrite(&short_len, sizeof(short_len), 1, context.outfile);
-                fwrite(offset, short_len, 1, context.outfile);
-                break;
-
-            case OUTPUT_TEXT_FULL: // Print packet similar to dig style
-                // Resolver and timestamp are not part of the packet, we therefore have to print it manually
-                fprintf(context.outfile, ";; Server: %s\n;; Size: %" PRIu16 "\n;; Unix time: %lu\n",
-                        sockaddr2str(recvaddr), short_len, now);
-                dns_print_packet(context.outfile, &packet, offset, len, next);
-                break;
-
-            case OUTPUT_NDJSON: // Only print records from answer section that match the query name (in ndjson)
-
-                for(size_t rec_index = 0; dns_parse_record_raw(offset, next, offset + len, &next, &rec); rec_index++)
+            // continue initial lookup after successful resolving of nameserver
+            // parse first valid answer into resolved_ip
+            char *query_name = strmcpy(dns_name2str(&packet.head.question.name));
+            dns_record_type query_type = (dns_record_type) packet.head.question.type;
+            uint16_t short_len = (uint16_t) len;
+            uint8_t *next = parse_offset;
+            dns_record_t rec;
+            char *resolved_ip = NULL;
+            for(size_t rec_index = 0; dns_parse_record_raw(offset, next, offset + len, &next, &rec); rec_index++)
+            {
+                if (strcmp(query_name, dns_name2str(&rec.name)) == 0 && query_type == ((dns_record_type) rec.type))
                 {
-                    fprintf(context.outfile,
-                            "{\"query_name\":\"%s\",\"query_type\":\"%s\",",
-                            dns_name2str(&packet.head.question.name),
-                            dns_record_type2str((dns_record_type) packet.head.question.type));
-
-                    json_escape(json_buffer, dns_raw_record_data2str(&rec, offset, offset + short_len), sizeof(json_buffer));
-
-                    fprintf(context.outfile,
-                            "\"resp_name\":\"%s\",\"resp_type\":\"%s\",\"data\":\"%s\"}\n",
-                            dns_name2str(&rec.name),
-                            dns_record_type2str((dns_record_type) rec.type),
-                            json_buffer);
+                    
+                    resolved_ip = strmcpy(dns_raw_record_data2str(&rec, offset, offset + short_len));
+                    break;
                 }
-
-                break;
-            
-            case OUTPUT_CSV_SIMPLE: // Only print records from answer section that match the query name and query type (in simple csv format)
-                query_name = strmcpy(dns_name2str(&packet.head.question.name));
-                query_type = (dns_record_type) packet.head.question.type;
-                fprintf(context.outfile,
-                        "%s;%s;@%s;%s;",
-                        query_name,
-                        dns_record_type2str(query_type),
-                        sockaddr2str(recvaddr),
-                        dns_rcode2str((dns_rcode)packet.head.header.rcode));
-                bool is_first = true;
-                for(size_t rec_index = 0; dns_parse_record_raw(offset, next, offset + len, &next, &rec); rec_index++)
+            }
+            free(query_name);
+            if(lookup->initial_lookups)
+            {
+                if(resolved_ip)
                 {
-                    if (strcmp(query_name, dns_name2str(&rec.name)) == 0 && query_type == ((dns_record_type) rec.type))
+                    //log_msg("First resolved answer: %s to %s\n", dns_name2str(&packet.head.question.name), resolved_ip);
+                    finish_lookup_with_resolved_ns(lookup, resolved_ip);
+                    free(resolved_ip);
+                }
+                else
+                {
+                    // possibly retry ns lookup on empty answer
+                    if(++lookup->empty_ns_tries < context.cmd_args.empty_ns_resolve_count && retry(lookup))
                     {
-                        
+                        // retry and do not output anything for this empty answer
+                        return;
+                    }
+                    // fallback if answer is not valid
+                    fallback_lookups(lookup);
+                }
+                    
+            }
+            
+        }
+        if(lookup->normal_lookup)
+        {
+            // Print packet
+            time_t now = time(NULL);
+            uint16_t short_len = (uint16_t) len;
+            uint8_t *next = parse_offset;
+            dns_record_t rec;
+            size_t non_add_count = packet.head.header.ans_count + packet.head.header.auth_count;
+            dns_section_t section = DNS_SECTION_ANSWER;
+            char *query_name;
+            dns_record_type query_type;
+
+            switch(context.cmd_args.output)
+            {
+                case OUTPUT_BINARY:
+                    // The output file is platform dependent for performance reasons.
+                    fwrite(&now, sizeof(now), 1, context.outfile);
+                    fwrite(recvaddr, sizeof(*recvaddr), 1, context.outfile);
+                    fwrite(&short_len, sizeof(short_len), 1, context.outfile);
+                    fwrite(offset, short_len, 1, context.outfile);
+                    break;
+
+                case OUTPUT_TEXT_FULL: // Print packet similar to dig style
+                    // Resolver and timestamp are not part of the packet, we therefore have to print it manually
+                    fprintf(context.outfile, ";; Server: %s\n;; Size: %" PRIu16 "\n;; Unix time: %lu\n",
+                            sockaddr2str(recvaddr), short_len, now);
+                    dns_print_packet(context.outfile, &packet, offset, len, next);
+                    break;
+
+                case OUTPUT_NDJSON: // Only print records from answer section that match the query name (in ndjson)
+
+                    for(size_t rec_index = 0; dns_parse_record_raw(offset, next, offset + len, &next, &rec); rec_index++)
+                    {
+                        fprintf(context.outfile,
+                                "{\"query_name\":\"%s\",\"query_type\":\"%s\",",
+                                dns_name2str(&packet.head.question.name),
+                                dns_record_type2str((dns_record_type) packet.head.question.type));
+
                         json_escape(json_buffer, dns_raw_record_data2str(&rec, offset, offset + short_len), sizeof(json_buffer));
 
                         fprintf(context.outfile,
-                                "%s\"%s\"",
-                                is_first ? "[" : ",",
+                                "\"resp_name\":\"%s\",\"resp_type\":\"%s\",\"data\":\"%s\"}\n",
+                                dns_name2str(&rec.name),
+                                dns_record_type2str((dns_record_type) rec.type),
                                 json_buffer);
-                        is_first = false;
                     }
-                }
-                fprintf(context.outfile, "%s\n", is_first ? "" : "]");
-                free(query_name);
-                break;
 
-            case OUTPUT_TEXT_SIMPLE: // Only print records from answer section that match the query name
-                if(context.format.print_question)
-                {
-                    if(!context.format.include_meta)
+                    break;
+                
+                case OUTPUT_CSV_SIMPLE: // Only print records from answer section that match the query name and query type (in simple csv format)
+                    query_name = strmcpy(dns_name2str(&packet.head.question.name));
+                    query_type = (dns_record_type) packet.head.question.type;
+                    fprintf(context.outfile,
+                            "%s;%s;@%s;%s;",
+                            query_name,
+                            dns_record_type2str(query_type),
+                            sockaddr2str(recvaddr),
+                            dns_rcode2str((dns_rcode)packet.head.header.rcode));
+                    bool is_first = true;
+                    for(size_t rec_index = 0; dns_parse_record_raw(offset, next, offset + len, &next, &rec); rec_index++)
                     {
-                        fprintf(context.outfile,
-                                "%s %s %s\n",
-                                dns_name2str(&packet.head.question.name),
-                                context.format.ttl ? dns_class2str((dns_class) packet.head.question.class) : "",
-                                dns_record_type2str((dns_record_type) packet.head.question.type));
-                    }
-                    else
-                    {
-                        fprintf(context.outfile,
-                                "%s %lu %s %s %s %s\n",
-                                sockaddr2str(recvaddr),
-                                now,
-                                dns_rcode2str((dns_rcode)packet.head.header.rcode),
-                                dns_name2str(&packet.head.question.name),
-                                context.format.ttl ? dns_class2str((dns_class) packet.head.question.class) : "",
-                                dns_record_type2str((dns_record_type) packet.head.question.type));
-                    }
-                }
-                for(size_t rec_index = 0; dns_parse_record_raw(offset, next, offset + len, &next, &rec); rec_index++)
-                {
-                    char *section_separator = "";
-                    if(rec_index >= packet.head.header.ans_count)
-                    {
-                        if(rec_index >= non_add_count)
+                        if (strcmp(query_name, dns_name2str(&rec.name)) == 0 && query_type == ((dns_record_type) rec.type))
                         {
-                            // We are entering a new section
-                            if(context.format.separate_sections && section != DNS_SECTION_ADDITIONAL)
-                            {
-                                section_separator = "\n";
-                            }
-                            section = DNS_SECTION_ADDITIONAL;
+                            
+                            json_escape(json_buffer, dns_raw_record_data2str(&rec, offset, offset + short_len), sizeof(json_buffer));
+
+                            fprintf(context.outfile,
+                                    "%s\"%s\"",
+                                    is_first ? "[" : ",",
+                                    json_buffer);
+                            is_first = false;
+                        }
+                    }
+                    fprintf(context.outfile, "%s\n", is_first ? "" : "]");
+                    free(query_name);
+                    break;
+
+                case OUTPUT_TEXT_SIMPLE: // Only print records from answer section that match the query name
+                    if(context.format.print_question)
+                    {
+                        if(!context.format.include_meta)
+                        {
+                            fprintf(context.outfile,
+                                    "%s %s %s\n",
+                                    dns_name2str(&packet.head.question.name),
+                                    context.format.ttl ? dns_class2str((dns_class) packet.head.question.class) : "",
+                                    dns_record_type2str((dns_record_type) packet.head.question.type));
                         }
                         else
                         {
-                            // We are entering a new section
-                            if(context.format.separate_sections && section != DNS_SECTION_AUTHORITY)
-                            {
-                                section_separator = "\n";
-                            }
-                            section = DNS_SECTION_AUTHORITY;
+                            fprintf(context.outfile,
+                                    "%s %lu %s %s %s %s\n",
+                                    sockaddr2str(recvaddr),
+                                    now,
+                                    dns_rcode2str((dns_rcode)packet.head.header.rcode),
+                                    dns_name2str(&packet.head.question.name),
+                                    context.format.ttl ? dns_class2str((dns_class) packet.head.question.class) : "",
+                                    dns_record_type2str((dns_record_type) packet.head.question.type));
                         }
                     }
+                    for(size_t rec_index = 0; dns_parse_record_raw(offset, next, offset + len, &next, &rec); rec_index++)
+                    {
+                        char *section_separator = "";
+                        if(rec_index >= packet.head.header.ans_count)
+                        {
+                            if(rec_index >= non_add_count)
+                            {
+                                // We are entering a new section
+                                if(context.format.separate_sections && section != DNS_SECTION_ADDITIONAL)
+                                {
+                                    section_separator = "\n";
+                                }
+                                section = DNS_SECTION_ADDITIONAL;
+                            }
+                            else
+                            {
+                                // We are entering a new section
+                                if(context.format.separate_sections && section != DNS_SECTION_AUTHORITY)
+                                {
+                                    section_separator = "\n";
+                                }
+                                section = DNS_SECTION_AUTHORITY;
+                            }
+                        }
 
-                    if((context.format.match_name && !dns_names_eq(&rec.name, &packet.head.question.name))
-                            || !context.format.sections[section])
-                    {
-                        continue;
+                        if((context.format.match_name && !dns_names_eq(&rec.name, &packet.head.question.name))
+                                || !context.format.sections[section])
+                        {
+                            continue;
+                        }
+                        if(!context.format.ttl)
+                        {
+                            fprintf(context.outfile,
+                                    "%s%s%s %s %s\n",
+                                    section_separator,
+                                    context.format.indent_sections ? "\t" : "",
+                                    dns_name2str(&rec.name),
+                                    dns_record_type2str((dns_record_type) rec.type),
+                                    dns_raw_record_data2str(&rec, offset, offset + short_len));
+                        }
+                        else
+                        {
+                            fprintf(context.outfile,
+                                    "%s%s%s %s %" PRIu32 " %s %s\n",
+                                    section_separator,
+                                    context.format.indent_sections ? "\t" : "",
+                                    dns_name2str(&rec.name),
+                                    dns_class2str((dns_class)rec.class),
+                                    rec.ttl,
+                                    dns_record_type2str((dns_record_type) rec.type),
+                                    dns_raw_record_data2str(&rec, offset, offset + short_len));
+                        }
                     }
-                    if(!context.format.ttl)
+                    if(context.format.separate_queries)
                     {
-                        fprintf(context.outfile,
-                                "%s%s%s %s %s\n",
-                                section_separator,
-                                context.format.indent_sections ? "\t" : "",
-                                dns_name2str(&rec.name),
-                                dns_record_type2str((dns_record_type) rec.type),
-                                dns_raw_record_data2str(&rec, offset, offset + short_len));
+                        fprintf(context.outfile, "\n");
                     }
-                    else
-                    {
-                        fprintf(context.outfile,
-                                "%s%s%s %s %" PRIu32 " %s %s\n",
-                                section_separator,
-                                context.format.indent_sections ? "\t" : "",
-                                dns_name2str(&rec.name),
-                                dns_class2str((dns_class)rec.class),
-                                rec.ttl,
-                                dns_record_type2str((dns_record_type) rec.type),
-                                dns_raw_record_data2str(&rec, offset, offset + short_len));
-                    }
-                }
-                if(context.format.separate_queries)
-                {
-                    fprintf(context.outfile, "\n");
-                }
-                break;
+                    break;
+            }
         }
-
         lookup_done(lookup);
-        
         // Sometimes, users may want to obtain results immediately.
         if(context.cmd_args.flush)
         {
@@ -1625,6 +1846,15 @@ void run()
         clean_exit(EXIT_FAILURE);
     }
 
+    context.nameserver_map = hashmapCreate(context.cmd_args.hashmap_size, hash_string, (bool (*)(void *, void *)) strcmp);
+    if(context.nameserver_map == NULL)
+    {
+        log_msg("Failed to create nameserver hashmap.\n");
+        clean_exit(EXIT_FAILURE);
+    }
+
+    context.dynamic_resolvers = single_list_new();
+
     context.lookup_pool.len = context.cmd_args.hashmap_size;
     context.lookup_pool.data = safe_calloc(context.lookup_pool.len * sizeof(void*));
     context.lookup_space = safe_calloc(context.lookup_pool.len * sizeof(*context.lookup_space));
@@ -1721,7 +1951,7 @@ void run()
     // requires the protocol.
     query_sockets_setup();
     context.resolvers = massdns_resolvers_from_file(context.cmd_args.resolvers);
-
+    
     privilege_drop();
 
 #ifdef HAVE_EPOLL
@@ -1861,6 +2091,8 @@ int parse_cmd(int argc, char **argv)
     context.format.sections[DNS_SECTION_ANSWER] = true;
 
     context.cmd_args.resolve_count = 50;
+    context.cmd_args.single_resolve_count = 3;
+    context.cmd_args.empty_ns_resolve_count = 3;
     context.cmd_args.hashmap_size = 10000;
     context.cmd_args.interval_ms = 500;
     context.cmd_args.timed_ring_buckets = 10000;
@@ -2091,6 +2323,14 @@ int parse_cmd(int argc, char **argv)
         else if (strcmp(argv[i], "--resolve-count") == 0 || strcmp(argv[i], "-c") == 0)
         {
             context.cmd_args.resolve_count = (uint8_t) expect_arg_nonneg(i++, 1, UINT8_MAX);
+        }
+        else if (strcmp(argv[i], "--single-resolve-count") == 0)
+        {
+            context.cmd_args.single_resolve_count = (uint8_t) expect_arg_nonneg(i++, 1, UINT8_MAX);
+        }
+        else if (strcmp(argv[i], "--empty-ns-resolve-count") == 0)
+        {
+            context.cmd_args.empty_ns_resolve_count = (uint8_t) expect_arg_nonneg(i++, 1, UINT8_MAX);
         }
         else if (strcmp(argv[i], "--hashmap-size") == 0 || strcmp(argv[i], "-s") == 0)
         {

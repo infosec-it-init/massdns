@@ -70,6 +70,7 @@ typedef struct
 {
     struct sockaddr_storage address;
     resolver_stats_t stats; // To be used to track resolver bans or non-replying resolvers
+    bool dedicated_nameserver;
 } resolver_t;
 
 typedef struct
@@ -81,11 +82,15 @@ typedef struct
 typedef struct
 {
     unsigned char tries;
+    unsigned char single_tries;
     uint16_t transaction;
     void **ring_entry; // pointer to the entry within the timed ring for entry invalidation
     resolver_t *resolver;
     char **nameservers;
     size_t nameserver_index;
+    single_list_t *initial_lookups;
+    unsigned char empty_ns_tries;
+    bool normal_lookup;
     lookup_key_t *key;
     socket_info_t *socket;
 } lookup_t;
@@ -119,6 +124,7 @@ const char *default_interfaces[] = {""};
 typedef struct
 {
     buffer_t resolvers;
+    single_list_t *dynamic_resolvers;
     lookup_entry_t *lookup_space;
     buffer_t lookup_pool;
     Hashmap *resolver_map;
@@ -150,6 +156,8 @@ typedef struct
         char *domains;
         char *outfile_name;
         uint8_t resolve_count;
+        uint8_t single_resolve_count;
+        uint8_t empty_ns_resolve_count;
         size_t hashmap_size;
         unsigned int interval_ms;
         bool norecurse;
@@ -199,6 +207,7 @@ typedef struct
     ssize_t domainfile_size;
     int epollfd;
     Hashmap *map;
+    Hashmap *nameserver_map;
     state_t state;
     timed_ring_t ring; // handles timeouts
     size_t lookup_index;

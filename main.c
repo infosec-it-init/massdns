@@ -100,11 +100,13 @@ void free_lookup(lookup_t *lookup)
             free(*(lookup->nameservers + i));
         }
         free(lookup->nameservers);
+        lookup->nameservers = NULL;
     }
     // free the initial lookup list
     if(lookup->initial_lookups)
     {
-        single_list_free(lookup->initial_lookups);
+        single_list_free_with_elements(lookup->initial_lookups);
+        lookup->initial_lookups = NULL;
     }
 }
 
@@ -602,6 +604,9 @@ void send_query_to_nameserver(lookup_t *lookup)
             bool new;
             // create a new lookup for the nameserver
             lookup_t *ns_lookup = new_lookup(nameserver, context.cmd_args.record_type, &new);
+            lookup_key_t *initial_lookup_key = safe_calloc(sizeof(*initial_lookup_key));
+            initial_lookup_key->name.length = (uint8_t)string_copy((char*)initial_lookup_key->name.name, (char*)lookup->key->name.name, sizeof(initial_lookup_key->name.name));
+            initial_lookup_key->type = lookup->key->type;
             
             // Pause the timeout of the initial lookup until nameserver is resolved
             timed_ring_remove(&context.ring, lookup->ring_entry);
@@ -613,7 +618,7 @@ void send_query_to_nameserver(lookup_t *lookup)
                 ns_lookup->normal_lookup = false;
                 ns_lookup->initial_lookups = single_list_new();
                 //log_msg("pushing to fresh initial lookups: %s (%s)\n", lookup->key->name.name, ns_lookup->key->name.name);
-                single_list_push_back(ns_lookup->initial_lookups, lookup);
+                single_list_push_back(ns_lookup->initial_lookups, initial_lookup_key);
                 send_query(ns_lookup);
             }
             else
@@ -624,7 +629,7 @@ void send_query_to_nameserver(lookup_t *lookup)
                 {
                     ns_lookup->initial_lookups = single_list_new();
                 }
-                single_list_push_back(ns_lookup->initial_lookups, lookup);
+                single_list_push_back(ns_lookup->initial_lookups, initial_lookup_key);
             }
         }
     }
@@ -1145,22 +1150,30 @@ void finish_lookup_with_resolved_ns(lookup_t *lookup, char *resolved_ip)
         single_list_element_t* element = lookup->initial_lookups->first;
         while (element != NULL)
         {
-            lookup_t *initial_lookup = (lookup_t *) element->data;
-            initial_lookup->nameserver_index++;
-            // re-install the timeout
-            initial_lookup->ring_entry = timed_ring_add(&context.ring, context.cmd_args.interval_ms * TIMED_RING_MS, initial_lookup);
-            if(valid_resolver)
+            lookup_key_t *initial_lookup_key = (lookup_key_t *) element->data;
+            lookup_t *initial_lookup = hashmapGet(context.map, initial_lookup_key);
+            if(!initial_lookup) // Most likely reason: delayed response after duplicate query
             {
-                initial_lookup->resolver = resolver;
-                send_query_with_resolver(initial_lookup);
+                context.stats.mismatch_domain++;
             }
             else
             {
-                send_query(initial_lookup);
+                initial_lookup->nameserver_index++;
+                // resume the timer
+                initial_lookup->ring_entry = timed_ring_add(&context.ring, context.cmd_args.interval_ms * TIMED_RING_MS, initial_lookup);
+                if(valid_resolver)
+                {
+                    initial_lookup->resolver = resolver;
+                    send_query_with_resolver(initial_lookup);
+                }
+                else
+                {
+                    send_query(initial_lookup);
+                }   
             }
             element = element->next;
         }
-        single_list_free(lookup->initial_lookups);
+        single_list_free_with_elements(lookup->initial_lookups);
         lookup->initial_lookups = NULL;
     }
 }
@@ -1172,12 +1185,20 @@ void fallback_lookups(lookup_t *lookup)
         single_list_element_t* element = lookup->initial_lookups->first;
         while (element != NULL)
         {
-            lookup_t *initial_lookup = (lookup_t *) element->data;
-            initial_lookup->nameserver_index++;
-            send_query(initial_lookup);
+            lookup_key_t *initial_lookup_key = (lookup_key_t *) element->data;
+            lookup_t *initial_lookup = hashmapGet(context.map, initial_lookup_key);
+            if(!initial_lookup) // Most likely reason: delayed response after duplicate query
+            {
+                context.stats.mismatch_domain++;
+            }
+            else
+            {
+                initial_lookup->nameserver_index++;
+                send_query(initial_lookup);
+            }
             element = element->next;
         }
-        single_list_free(lookup->initial_lookups);
+        single_list_free_with_elements(lookup->initial_lookups);
         lookup->initial_lookups = NULL;
     }
 }

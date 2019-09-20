@@ -127,6 +127,7 @@ typedef struct
     single_list_t *dynamic_resolvers;
     lookup_entry_t *lookup_space;
     buffer_t lookup_pool;
+    size_t pausing_lookups;
     Hashmap *resolver_map;
 
     struct
@@ -156,6 +157,7 @@ typedef struct
         char *domains;
         char *outfile_name;
         uint8_t resolve_count;
+        uint8_t ns_resolve_count;
         uint8_t single_resolve_count;
         uint8_t empty_ns_resolve_count;
         size_t hashmap_size;

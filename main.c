@@ -610,6 +610,7 @@ void send_query_to_nameserver(lookup_t *lookup)
             
             // Pause the timeout of the initial lookup until nameserver is resolved
             timed_ring_remove(&context.ring, lookup->ring_entry);
+            context.pausing_lookups++;
             
             if(new)
             {
@@ -850,6 +851,11 @@ void check_progress()
             progress = domain_file_position / (float)context.domainfile_size;
         }
     }
+    if(progress == 1)
+    {
+        // estimate the progress based on the number of finished packets
+        progress = context.stats.finished / (float)context.stats.numdomains;
+    }
 
     time_t total_elapsed_ns = (now.tv_sec - context.stats.start_time.tv_sec) * 1000000000
         + (now.tv_nsec - context.stats.start_time.tv_nsec); // since last output
@@ -1012,8 +1018,8 @@ void can_send()
     char **nameservers;
     bool new;
 
-    // always have one extra for an additional possible nameserver lookup
-    while (hashmapSize(context.map) < context.cmd_args.hashmap_size - 5 && context.state <= STATE_QUERYING)
+    // always have one + number of pausing lookups extra for an additional possible nameserver lookup and resuming the pausing lookups
+    while (hashmapSize(context.map) < context.cmd_args.hashmap_size - 1 - context.pausing_lookups && context.state <= STATE_QUERYING)
     {
         if(!next_query(&qname, &nameservers))
         {
@@ -1043,7 +1049,10 @@ bool is_unacceptable(dns_pkt_t *packet)
 
 void lookup_done(lookup_t *lookup)
 {
-    context.stats.finished++;
+    if(lookup->normal_lookup)
+    {
+        context.stats.finished++;
+    }
 
     free_lookup(lookup);
     hashmapRemove(context.map, lookup->key);
@@ -1071,7 +1080,7 @@ bool retry(lookup_t *lookup)
 {
     context.stats.timeouts[lookup->tries]--;
     context.stats.timeouts[++lookup->tries]++;
-    if(lookup->tries < context.cmd_args.resolve_count)
+    if((lookup->normal_lookup && lookup->tries < context.cmd_args.resolve_count) || (!lookup->normal_lookup && lookup->tries < context.cmd_args.ns_resolve_count))
     {
         lookup->ring_entry = timed_ring_add(&context.ring, context.cmd_args.interval_ms * TIMED_RING_MS, lookup);
         // use a dedicated nameserver several times in a retry (until single_resolve_count is reached) before switching to next resolver
@@ -1099,20 +1108,6 @@ bool retry(lookup_t *lookup)
     return false;
 }
 
-void ring_timeout(void *param)
-{
-    if(param == check_progress)
-    {
-        check_progress();
-        return;
-    }
-
-    lookup_t *lookup = param;
-    if(!retry(lookup))
-    {
-        lookup_done(lookup);
-    }
-}
 void finish_lookup_with_resolved_ns(lookup_t *lookup, char *resolved_ip)
 {
     if(lookup->initial_lookups)
@@ -1150,6 +1145,7 @@ void finish_lookup_with_resolved_ns(lookup_t *lookup, char *resolved_ip)
         single_list_element_t* element = lookup->initial_lookups->first;
         while (element != NULL)
         {
+            context.pausing_lookups--;
             lookup_key_t *initial_lookup_key = (lookup_key_t *) element->data;
             lookup_t *initial_lookup = hashmapGet(context.map, initial_lookup_key);
             if(!initial_lookup) // Most likely reason: delayed response after duplicate query
@@ -1185,6 +1181,7 @@ void fallback_lookups(lookup_t *lookup)
         single_list_element_t* element = lookup->initial_lookups->first;
         while (element != NULL)
         {
+            context.pausing_lookups--;
             lookup_key_t *initial_lookup_key = (lookup_key_t *) element->data;
             lookup_t *initial_lookup = hashmapGet(context.map, initial_lookup_key);
             if(!initial_lookup) // Most likely reason: delayed response after duplicate query
@@ -1194,12 +1191,34 @@ void fallback_lookups(lookup_t *lookup)
             else
             {
                 initial_lookup->nameserver_index++;
+                // resume the timer
+                initial_lookup->ring_entry = timed_ring_add(&context.ring, context.cmd_args.interval_ms * TIMED_RING_MS, initial_lookup);
                 send_query(initial_lookup);
             }
             element = element->next;
         }
         single_list_free_with_elements(lookup->initial_lookups);
         lookup->initial_lookups = NULL;
+    }
+}
+
+void ring_timeout(void *param)
+{
+    if(param == check_progress)
+    {
+        check_progress();
+        return;
+    }
+
+    lookup_t *lookup = param;
+    if(!retry(lookup))
+    {
+        // fallback for initial lookups depending on this ns lookup
+        if(lookup->initial_lookups)
+        {
+            fallback_lookups(lookup);
+        }
+        lookup_done(lookup);
     }
 }
 
@@ -1265,9 +1284,12 @@ void do_read(uint8_t *offset, size_t len, struct sockaddr_storage *recvaddr)
     else
     {
         // We are done with the lookup because we received an acceptable reply.
-        context.stats.finished_success++;
-        context.stats.final_rcodes[packet.head.header.rcode]++;
-        context.stats.success_rate++;
+        if(lookup->normal_lookup)
+        {
+            context.stats.finished_success++;
+            context.stats.final_rcodes[packet.head.header.rcode]++;
+            context.stats.success_rate++;
+        }
         if(lookup->initial_lookups)
         {
             // continue initial lookup after successful resolving of nameserver
@@ -2112,6 +2134,7 @@ int parse_cmd(int argc, char **argv)
     context.format.sections[DNS_SECTION_ANSWER] = true;
 
     context.cmd_args.resolve_count = 50;
+    context.cmd_args.ns_resolve_count = 5;
     context.cmd_args.single_resolve_count = 3;
     context.cmd_args.empty_ns_resolve_count = 3;
     context.cmd_args.hashmap_size = 10000;
@@ -2344,6 +2367,10 @@ int parse_cmd(int argc, char **argv)
         else if (strcmp(argv[i], "--resolve-count") == 0 || strcmp(argv[i], "-c") == 0)
         {
             context.cmd_args.resolve_count = (uint8_t) expect_arg_nonneg(i++, 1, UINT8_MAX);
+        }
+        else if (strcmp(argv[i], "--ns-resolve-count") == 0)
+        {
+            context.cmd_args.ns_resolve_count = (uint8_t) expect_arg_nonneg(i++, 1, UINT8_MAX);
         }
         else if (strcmp(argv[i], "--single-resolve-count") == 0)
         {

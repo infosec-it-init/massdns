@@ -1071,6 +1071,14 @@ bool is_unacceptable(dns_pkt_t *packet)
     return context.cmd_args.retry_codes[packet->head.header.rcode];
 }
 
+void write_exhausted_tries(lookup_t *lookup, char *status)
+{
+    if(context.cmd_args.write_exhausted_tries && context.cmd_args.output== OUTPUT_CSV_SIMPLE)
+    {
+        fprintf(context.outfile, "%s;%s;;%s;\n", lookup->key->name.name, dns_record_type2str(lookup->key->type), status);
+    }
+}
+
 void lookup_done(lookup_t *lookup)
 {
     if(lookup->normal_lookup)
@@ -1256,7 +1264,9 @@ void ring_timeout(void *param)
         {
             fallback_lookups(lookup);
         }
+        write_exhausted_tries(lookup, "TIMEOUT");
         lookup_done(lookup);
+        
     }
 }
 
@@ -1316,6 +1326,7 @@ void do_read(uint8_t *offset, size_t len, struct sockaddr_storage *recvaddr)
                 fallback_lookups(lookup);
             }
             // If this is the case, we will not try again.
+            write_exhausted_tries(lookup, "MAXRETRIES");
             lookup_done(lookup);
         }
     }
@@ -2417,6 +2428,10 @@ int parse_cmd(int argc, char **argv)
         else if (strcmp(argv[i], "--empty-ns-resolve-count") == 0)
         {
             context.cmd_args.empty_ns_resolve_count = (uint8_t) expect_arg_nonneg(i++, 1, UINT8_MAX);
+        }
+        else if (strcmp(argv[i], "--write-exhausted") == 0)
+        {
+            context.cmd_args.write_exhausted_tries = true;
         }
         else if (strcmp(argv[i], "--hashmap-size") == 0 || strcmp(argv[i], "-s") == 0)
         {

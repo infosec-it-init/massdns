@@ -188,6 +188,7 @@ typedef struct
         size_t socket_count;
         bool busypoll;
         bool resolve_nameservers;
+        bool write_exhausted_tries;
     } cmd_args;
 
     struct

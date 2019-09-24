@@ -85,6 +85,7 @@ typedef struct
     unsigned char single_tries;
     uint16_t transaction;
     void **ring_entry; // pointer to the entry within the timed ring for entry invalidation
+    bool pending_sublookup;
     resolver_t *resolver;
     char **nameservers;
     size_t nameserver_index;

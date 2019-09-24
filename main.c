@@ -585,6 +585,24 @@ void send_query_with_resolver(lookup_t *lookup);
 void send_query_to_nameserver(lookup_t *lookup)
 {
     char *nameserver = *(lookup->nameservers + lookup->nameserver_index);
+    // check that nameserver is not identical to target lookup
+    lookup_key_t *ns_lookup_key = safe_calloc(sizeof(*ns_lookup_key));
+    ns_lookup_key->name.length = (uint8_t)string_copy((char*)ns_lookup_key->name.name, nameserver, sizeof(ns_lookup_key->name.name));
+    if(ns_lookup_key->name.name[ns_lookup_key->name.length - 1] != '.')
+    {
+        ns_lookup_key->name.name[ns_lookup_key->name.length] = '.';
+        ns_lookup_key->name.name[++ns_lookup_key->name.length] = 0;
+    }
+    ns_lookup_key->type = lookup->key->type;
+    if(strcmp((char *) lookup->key->name.name, (char *) ns_lookup_key->name.name) == 0)
+    {
+        // skip nameserver as resolver that are identical to target lookup
+        lookup->nameserver_index++;
+        free(ns_lookup_key);
+        send_query(lookup);
+        return;
+    }
+    free(ns_lookup_key);
     //log_msg("trying nameserver %s for %s\n", nameserver, lookup->key->name.name);
     bool valid_resolver = false;
     if (context.cmd_args.resolve_nameservers)
@@ -602,6 +620,10 @@ void send_query_to_nameserver(lookup_t *lookup)
         else
         {
             bool new;
+            if(lookup->pending_sublookup)
+            {
+                return;
+            }
             // create a new lookup for the nameserver
             lookup_t *ns_lookup = new_lookup(nameserver, context.cmd_args.record_type, &new);
             lookup_key_t *initial_lookup_key = safe_calloc(sizeof(*initial_lookup_key));
@@ -610,6 +632,8 @@ void send_query_to_nameserver(lookup_t *lookup)
             
             // Pause the timeout of the initial lookup until nameserver is resolved
             timed_ring_remove(&context.ring, lookup->ring_entry);
+            // mark the lookup as pausing
+            lookup->pending_sublookup = true;
             context.pausing_lookups++;
             
             if(new)
@@ -1051,8 +1075,15 @@ void lookup_done(lookup_t *lookup)
 {
     if(lookup->normal_lookup)
     {
+        // only count the normal lookups
         context.stats.finished++;
     }
+    else
+    {
+        // remove the timeout counts for the lookup if not a normal one
+        context.stats.timeouts[lookup->tries]--;
+    }
+    
 
     free_lookup(lookup);
     hashmapRemove(context.map, lookup->key);
@@ -1080,11 +1111,16 @@ bool retry(lookup_t *lookup)
 {
     context.stats.timeouts[lookup->tries]--;
     context.stats.timeouts[++lookup->tries]++;
+    if(lookup->pending_sublookup)
+    {
+        // lookup is pausing, so no concurrent retry!!
+        return true; // Most likely reason: delayed response after duplicate query
+    }
     if((lookup->normal_lookup && lookup->tries < context.cmd_args.resolve_count) || (!lookup->normal_lookup && lookup->tries < context.cmd_args.ns_resolve_count))
     {
         lookup->ring_entry = timed_ring_add(&context.ring, context.cmd_args.interval_ms * TIMED_RING_MS, lookup);
         // use a dedicated nameserver several times in a retry (until single_resolve_count is reached) before switching to next resolver
-        if(lookup->resolver->dedicated_nameserver)
+        if(lookup->resolver && lookup->resolver->dedicated_nameserver)
         {
             if(++lookup->single_tries < context.cmd_args.single_resolve_count)
             {
@@ -1154,6 +1190,7 @@ void finish_lookup_with_resolved_ns(lookup_t *lookup, char *resolved_ip)
             }
             else
             {
+                initial_lookup->pending_sublookup = false;
                 initial_lookup->nameserver_index++;
                 // resume the timer
                 initial_lookup->ring_entry = timed_ring_add(&context.ring, context.cmd_args.interval_ms * TIMED_RING_MS, initial_lookup);
@@ -1190,6 +1227,7 @@ void fallback_lookups(lookup_t *lookup)
             }
             else
             {
+                initial_lookup->pending_sublookup = false;
                 initial_lookup->nameserver_index++;
                 // resume the timer
                 initial_lookup->ring_entry = timed_ring_add(&context.ring, context.cmd_args.interval_ms * TIMED_RING_MS, initial_lookup);

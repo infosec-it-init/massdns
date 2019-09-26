@@ -1073,7 +1073,7 @@ bool is_unacceptable(dns_pkt_t *packet)
 
 void write_exhausted_tries(lookup_t *lookup, char *status)
 {
-    if(context.cmd_args.write_exhausted_tries && context.cmd_args.output== OUTPUT_CSV_SIMPLE)
+    if(lookup->normal_lookup && context.cmd_args.write_exhausted_tries && context.cmd_args.output== OUTPUT_CSV_SIMPLE)
     {
         fprintf(context.outfile, "%s;%s;;%s;\n", lookup->key->name.name, dns_record_type2str(lookup->key->type), status);
     }

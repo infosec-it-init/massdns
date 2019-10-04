@@ -130,7 +130,9 @@ typedef struct
     buffer_t lookup_pool;
     size_t pausing_lookups;
     Hashmap *resolver_map;
-
+    size_t debug_pending;
+    size_t debug_hashmapsize;
+    
     struct
     {
         massdns_module_t handlers[MAXIMUM_MODULE_COUNT]; // we only support up to 255 modules
@@ -157,6 +159,7 @@ typedef struct
         char *resolvers;
         char *domains;
         char *outfile_name;
+        char *debugfile_name;
         uint8_t resolve_count;
         uint8_t ns_resolve_count;
         uint8_t single_resolve_count;
@@ -206,6 +209,7 @@ typedef struct
     bool *done;
 
     FILE* outfile;
+    FILE* debugfile;
     FILE* logfile;
     FILE* domainfile;
     ssize_t domainfile_size;

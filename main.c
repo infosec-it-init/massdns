@@ -173,6 +173,10 @@ void cleanup()
     {
         fclose(context.outfile);
     }
+    if(context.debugfile)
+    {
+        fclose(context.debugfile);
+    }
     if(context.logfile)
     {
         fclose(context.logfile);
@@ -632,7 +636,7 @@ void send_query_to_nameserver(lookup_t *lookup)
             
             // Pause the timeout of the initial lookup until nameserver is resolved
             timed_ring_remove(&context.ring, lookup->ring_entry);
-            log_msg("Pausing lookup, setting sublookup flag for %s (ns: %s)\n", lookup->key->name.name, ns_lookup->key->name.name);
+            fprintf(context.debugfile, "Pausing lookup, setting sublookup flag for %s (ns: %s)\n", lookup->key->name.name, ns_lookup->key->name.name);
             // mark the lookup as pausing
             lookup->pending_sublookup = true;
             context.pausing_lookups++;
@@ -1095,7 +1099,7 @@ void lookup_done(lookup_t *lookup)
     
 
     free_lookup(lookup);
-    log_msg("Lookup done, removing %s\n", lookup->key->name.name);
+    fprintf(context.debugfile, "Lookup done, removing %s\n", lookup->key->name.name);
     hashmapRemove(context.map, lookup->key);
 
     // Return lookup to pool.
@@ -1115,33 +1119,37 @@ void lookup_done(lookup_t *lookup)
     {
         pending += context.ring.buckets[i].count;
     }
-    if(pending < 10)
+    size_t hashmapsize = hashmapSize(context.map);
+    if(context.debug_pending != pending || context.debug_hashmapsize != hashmapsize)
     {
-        for(size_t i = 0; i < context.ring.bucket_count; i++)
+        if(pending < 10)
         {
-            for(size_t j = 0; j < context.ring.buckets[i].count; j++)
+            for(size_t i = 0; i < context.ring.bucket_count; i++)
             {
-                if(context.ring.buckets[i].data[j] && context.ring.buckets[i].data[j] != check_progress)
+                for(size_t j = 0; j < context.ring.buckets[i].count; j++)
                 {
-                    lookup_t *lookup = (lookup_t *) context.ring.buckets[i].data[j];
-                    log_msg("Pending timer for: %s\n", lookup->key->name.name);
+                    if(context.ring.buckets[i].data[j] && context.ring.buckets[i].data[j] != check_progress)
+                    {
+                        lookup_t *lookup = (lookup_t *) context.ring.buckets[i].data[j];
+                        fprintf(context.debugfile, "Pending timer for: %s\n", lookup->key->name.name);
+                    }
                 }
             }
         }
-    }
-    log_msg("Hashmap size: %zu, pending timers: %d\n", hashmapSize(context.map), pending);
-    if(pending < 10)
-    {
-        for (size_t i = 0; i < context.map->bucketCount; i++) {
-            Entry* entry = context.map->buckets[i];
-            while (entry != NULL) {
-                Entry *next = entry->next;
-                if(entry->value)
-                {
-                    log_msg("Hashmap entry: %s\n", ((lookup_t * )entry->value)->key->name.name);
+        fprintf(context.debugfile, "Hashmap size: %zu, pending timers: %d\n", hashmapsize, pending);
+        if(pending < 10)
+        {
+            for (size_t i = 0; i < context.map->bucketCount; i++) {
+                Entry* entry = context.map->buckets[i];
+                while (entry != NULL) {
+                    Entry *next = entry->next;
+                    if(entry->value)
+                    {
+                        fprintf(context.debugfile, "Hashmap entry: %s\n", ((lookup_t * )entry->value)->key->name.name);
+                    }
+                    
+                    entry = next;
                 }
-                
-                entry = next;
             }
         }
     }
@@ -1158,11 +1166,11 @@ bool retry(lookup_t *lookup)
     context.stats.timeouts[++lookup->tries]++;
     if(lookup->pending_sublookup)
     {
-        log_msg("Not retrying %s because of pending sublookup\n", lookup->key->name.name);
+        fprintf(context.debugfile, "Not retrying %s because of pending sublookup\n", lookup->key->name.name);
         // lookup is pausing, so no concurrent retry!!
         return true; // Most likely reason: delayed response after duplicate query
     }
-    log_msg("Retry #%d for %s\n", lookup->tries, lookup->key->name.name);
+    fprintf(context.debugfile, "Retry #%d for %s\n", lookup->tries, lookup->key->name.name);
     if((lookup->normal_lookup && lookup->tries < context.cmd_args.resolve_count) || (!lookup->normal_lookup && lookup->tries < context.cmd_args.ns_resolve_count))
     {
         lookup->ring_entry = timed_ring_add(&context.ring, context.cmd_args.interval_ms * TIMED_RING_MS, lookup);
@@ -1234,7 +1242,7 @@ void finish_lookup_with_resolved_ns(lookup_t *lookup, char *resolved_ip)
             if(!initial_lookup) // Most likely reason: delayed response after duplicate query
             {
                 context.stats.mismatch_domain++;
-                log_msg("Mismatch after resolving: %s\n", initial_lookup_key->name.name);
+                fprintf(context.debugfile, "Mismatch after resolving: %s\n", initial_lookup_key->name.name);
             }
             else
             {
@@ -1244,13 +1252,13 @@ void finish_lookup_with_resolved_ns(lookup_t *lookup, char *resolved_ip)
                 initial_lookup->ring_entry = timed_ring_add(&context.ring, context.cmd_args.interval_ms * TIMED_RING_MS, initial_lookup);
                 if(valid_resolver)
                 {
-                    log_msg("Pending sublookup done for %s (success and valid resolver)\n", initial_lookup->key->name.name);
+                    fprintf(context.debugfile, "Pending sublookup done for %s (success and valid resolver)\n", initial_lookup->key->name.name);
                     initial_lookup->resolver = resolver;
                     send_query_with_resolver(initial_lookup);
                 }
                 else
                 {
-                    log_msg("Pending sublookup done for %s (invalid resolver!!)\n", initial_lookup->key->name.name);
+                    fprintf(context.debugfile, "Pending sublookup done for %s (invalid resolver!!)\n", initial_lookup->key->name.name);
                     send_query(initial_lookup);
                 }   
             }
@@ -1274,11 +1282,11 @@ void fallback_lookups(lookup_t *lookup)
             if(!initial_lookup) // Most likely reason: delayed response after duplicate query
             {
                 context.stats.mismatch_domain++;
-                log_msg("Mismatch after fallback: %s\n", initial_lookup_key->name.name);
+                fprintf(context.debugfile, "Mismatch after fallback: %s\n", initial_lookup_key->name.name);
             }
             else
             {
-                log_msg("Pending sublookup done for %s (fallback)\n", initial_lookup->key->name.name);
+                fprintf(context.debugfile, "Pending sublookup done for %s (fallback)\n", initial_lookup->key->name.name);
                 initial_lookup->pending_sublookup = false;
                 initial_lookup->nameserver_index++;
                 // resume the timer
@@ -1299,21 +1307,29 @@ void ring_timeout(void *param)
     {
         pending += context.ring.buckets[i].count;
     }
-    if(pending < 10)
+    size_t hashmapsize = hashmapSize(context.map);
+    if(context.debug_pending != pending || context.debug_hashmapsize != hashmapsize)
     {
-        for(size_t i = 0; i < context.ring.bucket_count; i++)
+        if(pending < 10)
         {
-            for(size_t j = 0; j < context.ring.buckets[i].count; j++)
+            for(size_t i = 0; i < context.ring.bucket_count; i++)
             {
-                if(context.ring.buckets[i].data[j] && context.ring.buckets[i].data[j] != check_progress)
+                for(size_t j = 0; j < context.ring.buckets[i].count; j++)
                 {
-                    lookup_t *lookup = (lookup_t *) context.ring.buckets[i].data[j];
-                    log_msg("Pending timer for: %s\n", lookup->key->name.name);
+                    if(context.ring.buckets[i].data[j] && context.ring.buckets[i].data[j] != check_progress)
+                    {
+                        lookup_t *lookup = (lookup_t *) context.ring.buckets[i].data[j];
+                        fprintf(context.debugfile, "Pending timer for: %s\n", lookup->key->name.name);
+                    }
                 }
             }
         }
+        fprintf(context.debugfile, "Hashmap size: %zu, pending timers: %d\n", hashmapsize, pending);
+        if(hashmapsize < 10)
+        fflush(context.debugfile);
+        context.debug_hashmapsize = hashmapsize;
+        context.debug_pending = pending;
     }
-    log_msg("Hashmap size: %zu, pending timers: %d\n", hashmapSize(context.map), pending);
     if(param == check_progress)
     {
         check_progress();
@@ -1321,7 +1337,7 @@ void ring_timeout(void *param)
     }
 
     lookup_t *lookup = param;
-    log_msg("Timeout for %s\n", lookup->key->name.name);
+    fprintf(context.debugfile, "Timeout for %s\n", lookup->key->name.name);
     if(!retry(lookup))
     {
         // fallback for initial lookups depending on this ns lookup
@@ -1377,12 +1393,12 @@ void do_read(uint8_t *offset, size_t len, struct sockaddr_storage *recvaddr)
         return;
     }
 
-    timed_ring_remove(&context.ring, lookup->ring_entry); // Clear timeout trigger
+    timed_ring_remove(&context.ring, lookup->ring_entry); // Clear timeout trigger    
 
     // Check whether we want to retry resending the packet
     if(is_unacceptable(&packet))
     {
-        log_msg("do read unacceptable for %s (%d)\n", lookup->key->name.name, packet.head.header.rcode);
+        fprintf(context.debugfile, "do read unacceptable for %s (%d)\n", lookup->key->name.name, packet.head.header.rcode);
         // We may have tried to many times already.
         if(!retry(lookup))
         {
@@ -2087,6 +2103,15 @@ void run()
             clean_exit(EXIT_FAILURE);
         }
     }
+    if(strcmp(context.cmd_args.debugfile_name, "-") != 0)
+    {
+        context.debugfile = fopen(context.cmd_args.debugfile_name, "w");
+        if(!context.debugfile)
+        {
+            log_msg("Failed to open debug file: %s\n", strerror(errno));
+            clean_exit(EXIT_FAILURE);
+        }
+    }
 
     if(context.domainfile != stdin)
     {
@@ -2244,6 +2269,9 @@ int parse_cmd(int argc, char **argv)
     context.logfile = stderr;
     context.outfile = stdout;
     context.cmd_args.outfile_name = "-";
+    
+    context.debugfile = fopen("/dev/null", "w");
+    context.cmd_args.debugfile_name = "-";
 
     context.format.match_name = true;
     context.format.sections[DNS_SECTION_ANSWER] = true;
@@ -2328,6 +2356,12 @@ int parse_cmd(int argc, char **argv)
         {
             expect_arg(i);
             context.cmd_args.outfile_name = argv[++i];
+
+        }
+        else if (strcmp(argv[i], "--debugfile") == 0)
+        {
+            expect_arg(i);
+            context.cmd_args.debugfile_name = argv[++i];
 
         }
         else if (strcmp(argv[i], "--error-log") == 0 || strcmp(argv[i], "-l") == 0)

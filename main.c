@@ -589,33 +589,43 @@ void send_query_with_resolver(lookup_t *lookup);
 void send_query_to_nameserver(lookup_t *lookup)
 {
     char *nameserver = *(lookup->nameservers + lookup->nameserver_index);
+    char normalized_nameserver[0xFF];
     // check that nameserver is not identical to target lookup
-    lookup_key_t *ns_lookup_key = safe_calloc(sizeof(*ns_lookup_key));
+    uint8_t ns_len = (uint8_t)string_copy((char*)normalized_nameserver, nameserver, sizeof(normalized_nameserver));
+    /*lookup_key_t *ns_lookup_key = safe_calloc(sizeof(*ns_lookup_key));
     ns_lookup_key->name.length = (uint8_t)string_copy((char*)ns_lookup_key->name.name, nameserver, sizeof(ns_lookup_key->name.name));
     if(ns_lookup_key->name.name[ns_lookup_key->name.length - 1] != '.')
     {
         ns_lookup_key->name.name[ns_lookup_key->name.length] = '.';
         ns_lookup_key->name.name[++ns_lookup_key->name.length] = 0;
     }
-    ns_lookup_key->type = lookup->key->type;
-    if(strcmp((char *) lookup->key->name.name, (char *) ns_lookup_key->name.name) == 0)
+    ns_lookup_key->type = lookup->key->type;*/
+    if(normalized_nameserver[ns_len - 1] != '.')
+    {
+        normalized_nameserver[ns_len] = '.';
+        normalized_nameserver[++ns_len] = 0;
+    }
+    //if(strcmp((char *) lookup->key->name.name, (char *) ns_lookup_key->name.name) == 0)
+    if(strcmp((char *) lookup->key->name.name, normalized_nameserver) == 0)
     {
         // skip nameserver as resolver that are identical to target lookup
         lookup->nameserver_index++;
-        free(ns_lookup_key);
+        //free(ns_lookup_key);
         send_query(lookup);
         return;
     }
-    free(ns_lookup_key);
+    //free(ns_lookup_key);
     //log_msg("trying nameserver %s for %s\n", nameserver, lookup->key->name.name);
     bool valid_resolver = false;
     if (context.cmd_args.resolve_nameservers)
     {
         // check if resolved nameserver is already in hashmap!!
-        resolver_t *resolver = hashmapGet(context.nameserver_map, nameserver);
+        fprintf(context.debugfile, "Trying to find nameserver resolution in cache for %s\n", normalized_nameserver);
+        resolver_t *resolver = hashmapGet(context.nameserver_map, normalized_nameserver);
         if(resolver != NULL)
         {
             //log_msg("found resolver in cache for nameserver: %s\n", nameserver);
+            fprintf(context.debugfile, "Found resolved nameserver in cache for %s\n", normalized_nameserver);
             //log_msg("increasing nameserver_index: %s -> %d\n", lookup->key->name.name, lookup->nameserver_index);
             lookup->nameserver_index++;
             lookup->resolver = resolver;

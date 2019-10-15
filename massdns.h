@@ -124,12 +124,20 @@ const char *default_interfaces[] = {""};
 
 typedef struct
 {
+    lookup_t *lookup;
+    bool use_nameserver;
+} lookup_resume_t;
+
+
+typedef struct
+{
     buffer_t resolvers;
     single_list_t *dynamic_resolvers;
     lookup_entry_t *lookup_space;
     buffer_t lookup_pool;
     size_t pausing_lookups;
     Hashmap *resolver_map;
+    single_list_t *lookups_to_resume;
     size_t debug_pending;
     size_t debug_hashmapsize;
     

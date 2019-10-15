@@ -160,6 +160,11 @@ void cleanup()
         single_list_free_with_elements(context.dynamic_resolvers);
     }
 
+    if(context.lookups_to_resume)
+    {
+        single_list_free(context.lookups_to_resume);
+    }
+
     free(context.sockets.interfaces4.data);
     free(context.sockets.interfaces6.data);
 
@@ -1256,7 +1261,23 @@ void finish_lookup_with_resolved_ns(lookup_t *lookup, char *resolved_ip)
             }
             else
             {
-                initial_lookup->pending_sublookup = false;
+                lookup_resume_t resume = {
+                    .lookup = initial_lookup,
+                    .use_nameserver = valid_resolver
+                };
+                if (valid_resolver)
+                {
+                    initial_lookup->resolver = resolver;
+                    fprintf(context.debugfile, "Pending sublookup done for %s (success and valid resolver)\n", initial_lookup->key->name.name);
+                }
+                else
+                {
+                    fprintf(context.debugfile, "Pending sublookup done for %s (invalid resolver!!)\n", initial_lookup->key->name.name);
+                }
+                
+                single_list_push_back(context.lookups_to_resume, &resume);
+                
+                /*initial_lookup->pending_sublookup = false;
                 initial_lookup->nameserver_index++;
                 // resume the timer
                 initial_lookup->ring_entry = timed_ring_add(&context.ring, context.cmd_args.interval_ms * TIMED_RING_MS, initial_lookup);
@@ -1270,7 +1291,7 @@ void finish_lookup_with_resolved_ns(lookup_t *lookup, char *resolved_ip)
                 {
                     fprintf(context.debugfile, "Pending sublookup done for %s (invalid resolver!!)\n", initial_lookup->key->name.name);
                     send_query(initial_lookup);
-                }   
+                }*/
             }
             element = element->next;
         }
@@ -1297,17 +1318,49 @@ void fallback_lookups(lookup_t *lookup)
             else
             {
                 fprintf(context.debugfile, "Pending sublookup done for %s (fallback)\n", initial_lookup->key->name.name);
-                initial_lookup->pending_sublookup = false;
+                lookup_resume_t resume = {
+                    .lookup = initial_lookup,
+                    .use_nameserver = false
+                };
+                single_list_push_back(context.lookups_to_resume, &resume);
+                /*initial_lookup->pending_sublookup = false;
                 initial_lookup->nameserver_index++;
                 // resume the timer
                 initial_lookup->ring_entry = timed_ring_add(&context.ring, context.cmd_args.interval_ms * TIMED_RING_MS, initial_lookup);
-                send_query(initial_lookup);
+                send_query(initial_lookup);*/
             }
             element = element->next;
         }
         single_list_free_with_elements(lookup->initial_lookups);
         lookup->initial_lookups = NULL;
     }
+}
+
+void deferred_lookup_resuming(lookup_resume_t *resume)
+{
+    resume->lookup->pending_sublookup = false;
+    resume->lookup->nameserver_index++;
+    // resume the timer
+    resume->lookup->ring_entry = timed_ring_add(&context.ring, context.cmd_args.interval_ms * TIMED_RING_MS, resume->lookup);
+    if(resume->use_nameserver)
+    {
+        send_query_with_resolver(resume->lookup);
+    }
+    else
+    {
+        send_query(resume->lookup);
+    }
+}
+
+void deferred_resume()
+{
+    buffer_t resumes = single_list_to_array_copy(context.lookups_to_resume, sizeof(lookup_resume_t));
+    single_list_clear(context.lookups_to_resume);
+    for (size_t i = 0; i < resumes.len; i++)
+    {
+        deferred_lookup_resuming(((lookup_resume_t *)resumes.data) + i);
+    }
+    free(resumes.data);
 }
 
 void ring_timeout(void *param)
@@ -2039,6 +2092,8 @@ void run()
 
     context.dynamic_resolvers = single_list_new();
 
+    context.lookups_to_resume = single_list_new();
+
     context.lookup_pool.len = context.cmd_args.hashmap_size;
     context.lookup_pool.data = safe_calloc(context.lookup_pool.len * sizeof(void*));
     context.lookup_space = safe_calloc(context.lookup_pool.len * sizeof(*context.lookup_space));
@@ -2177,6 +2232,7 @@ void run()
             else if (ready == 0) // Epoll timeout
             {
                 timed_ring_handle(&context.ring, ring_timeout);
+                deferred_resume();
             }
             else if (ready > 0)
             {
@@ -2187,6 +2243,7 @@ void run()
                     {
                         can_send();
                         timed_ring_handle(&context.ring, ring_timeout);
+                        deferred_resume();
                     }
                     if ((pevents[i].events & EPOLLIN) && socket_info->type == SOCKET_TYPE_QUERY)
                     {
@@ -2209,6 +2266,7 @@ void run()
                     }
                 }
                 timed_ring_handle(&context.ring, ring_timeout);
+                deferred_resume();
             }
         }
 #endif
@@ -2227,6 +2285,7 @@ void run()
                 can_read(((socket_info_t*)context.sockets.interfaces6.data) + i);
             }
             timed_ring_handle(&context.ring, ring_timeout);
+            deferred_resume();
 
             if(context.cmd_args.num_processes > 1 && context.fork_index == 0)
             {

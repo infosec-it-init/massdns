@@ -449,7 +449,7 @@ void query_sockets_setup()
 
 bool next_query(char **qname, char ***nameservers)
 {
-    static char line[512];
+    static char line[2048];
     static size_t line_index = 0;
 
     while (fgets(line, sizeof(line), context.domainfile))

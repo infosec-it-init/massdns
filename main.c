@@ -89,6 +89,21 @@ void print_help()
     );
 }
 
+void free_lookup(lookup_t *lookup)
+{
+    // free the nameservers array
+    if(lookup->nameservers)
+    {
+        int i;
+        for (i = 0; *(lookup->nameservers + i); i++)
+        {
+            free(*(lookup->nameservers + i));
+        }
+        free(lookup->nameservers);
+        lookup->nameservers = NULL;
+    }
+}
+
 void cleanup()
 {
 #ifdef PCAP_SUPPORT
@@ -99,6 +114,17 @@ void cleanup()
 #endif
     if(context.map)
     {
+        // free the nameservers array
+        int i;
+        for (i = 0; i < context.map->bucketCount; i++)
+        {
+            Entry* entry = context.map->buckets[i];
+            while (entry != NULL)
+            {
+                free_lookup((lookup_t *) entry->value);
+                entry = entry->next;
+            }
+        }
         hashmapFree(context.map);
     }
 
@@ -398,9 +424,9 @@ void query_sockets_setup()
     }
 }
 
-bool next_query(char **qname)
+bool next_query(char **qname, char ***nameservers)
 {
-    static char line[512];
+    static char line[2048];
     static size_t line_index = 0;
 
     while (fgets(line, sizeof(line), context.domainfile))
@@ -418,7 +444,26 @@ bool next_query(char **qname)
         {
             continue;
         }
-        *qname = line;
+        char** parts;
+        char* line_copy = strmcpy(line);
+        parts = str_split(line_copy, ' ');
+        char* domain = strmcpy(*parts);
+        *qname = domain;
+        // check if there are nameservers
+        if (*(parts + 1))
+        {
+            // copy the array without the first element to a new array
+            int num_nameservers;
+            for (num_nameservers = 0; *(parts + num_nameservers + 1); num_nameservers++){}
+            *nameservers = malloc(sizeof(char*) * (num_nameservers + 1));
+            memcpy(*nameservers, parts + 1, sizeof(char*) * num_nameservers);
+            *(*nameservers + num_nameservers) = 0;
+        } else {
+            *nameservers = 0;
+        }
+        free(line_copy);
+        free(*parts);
+        free(parts);
 
         return true;
     }
@@ -510,6 +555,26 @@ lookup_t *new_lookup(const char *qname, dns_record_type type, bool *new)
     return value;
 }
 
+
+resolver_t* create_resolver_from_nameserver(char *nameserver)
+{
+    resolver_t *resolver = safe_calloc(sizeof(*resolver));
+    struct sockaddr_storage *addr = &resolver->address;
+    if (str_to_addr(nameserver, 53, addr))
+    {
+        if(!(addr->ss_family == AF_INET && context.sockets.interfaces4.len > 0)
+            && !(addr->ss_family == AF_INET6 && context.sockets.interfaces6.len > 0))
+        {
+            log_msg("No query socket for resolver \"%s\" found.\n", nameserver);
+        }
+    }
+    else
+    {
+        log_msg("\"%s\" is not a valid resolver. Skipped.\n", nameserver);
+    }
+    return resolver;
+}
+
 void send_query(lookup_t *lookup)
 {
     static uint8_t query_buffer[0x200];
@@ -518,7 +583,12 @@ void send_query(lookup_t *lookup)
     // Pool of resolvers cannot be empty due to check after parsing resolvers.
     if(!context.cmd_args.sticky || lookup->resolver == NULL)
     {
-        if(context.cmd_args.predictable_resolver)
+        if(lookup->nameservers && *(lookup->nameservers + lookup->nameserver_index))
+        {
+            lookup->resolver = create_resolver_from_nameserver(*(lookup->nameservers + lookup->nameserver_index));
+            lookup->nameserver_index++;
+        }
+        else if(context.cmd_args.predictable_resolver)
         {
             lookup->resolver = ((resolver_t *) context.resolvers.data) + context.lookup_index % context.resolvers.len;
         }
@@ -830,17 +900,22 @@ void done()
 void can_send()
 {
     char *qname;
+    char **nameservers;
     bool new;
 
     while (hashmapSize(context.map) < context.cmd_args.hashmap_size && context.state <= STATE_QUERYING)
     {
-        if(!next_query(&qname))
+        if(!next_query(&qname, &nameservers))
         {
             context.state = STATE_COOLDOWN; // We will not create any new queries
             break;
         }
         context.stats.numdomains++;
         lookup_t *lookup = new_lookup(qname, context.cmd_args.record_type, &new);
+        if (nameservers)
+        {
+            lookup->nameservers = nameservers;
+        }
         if(!new)
         {
             continue;
@@ -864,8 +939,18 @@ void write_exhausted_tries(lookup_t *lookup, char *status)
 
 void lookup_done(lookup_t *lookup)
 {
+    int i;
     context.stats.finished++;
 
+    // free the nameservers array
+    if (lookup->nameservers)
+    {
+        for (i = 0; *(lookup->nameservers + i); i++)
+        {
+            free(*(lookup->nameservers + i));
+        }
+        free(lookup->nameservers);
+    }
     hashmapRemove(context.map, lookup->key);
 
     // Return lookup to pool.
